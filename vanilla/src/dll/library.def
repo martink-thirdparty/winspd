@@ -1,0 +1,37 @@
+EXPORTS
+
+    ; ioctl.h
+    SpdIoctlGetDevicePath
+    SpdIoctlOpenDevice
+    SpdIoctlScsiExecute
+    SpdIoctlScsiInquiry
+    SpdIoctlProvision
+    SpdIoctlUnprovision
+    SpdIoctlGetList
+    SpdIoctlTransact
+    SpdIoctlSetTransactProcessId
+
+    ; winspd.h
+    SpdStorageUnitCreate
+    SpdStorageUnitDelete
+    SpdStorageUnitShutdown
+    SpdStorageUnitStartDispatcher
+    SpdStorageUnitWaitDispatcher
+    SpdStorageUnitSendResponse
+    SpdStorageUnitGetOperationContext
+    SpdStorageUnitSetBufferAllocatorF
+    SpdStorageUnitGetDispatcherErrorF
+    SpdStorageUnitSetDispatcherErrorF
+    SpdStorageUnitSetDebugLogF
+    SpdDefinePartitionTable
+    SpdPrintLog
+    SpdPrintLogV
+    SpdEventLog
+    SpdEventLogV
+    SpdServiceLog
+    SpdServiceLogV
+    SpdDebugLogSetHandle
+    SpdDebugLog
+    SpdDebugLogRequest
+    SpdDebugLogResponse
+    SpdVersion

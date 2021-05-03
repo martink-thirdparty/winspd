@@ -1,0 +1,781 @@
+= Tutorial: creating a user mode storage device
+:toc: preamble
+:toc-title:
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+
+In this tutorial we describe the process of creating a simple user mode storage device using WinSpd. The storage device we will create is called "rawdisk" and stores disk data as raw data in a regular file.
+
+== Prerequisites
+
+This tutorial assumes that you have WinSpd and Visual Studio 2015 installed. The WinSpd installer can be downloaded from the WinSpd GitHub repository: https://github.com/billziss-gh/winspd. The Microsoft Visual Studio Community 2015 can be downloaded for free from Microsoft's web site.
+
+When installing WinSpd make sure to choose "Developer" to ensure that all necessary header and library files are included in the installation.
+
+image::WinSpd-Tutorial/Installer.png[WinSpd Installer]
+
+With those prerequisites out of the way we are now ready to start creating our first storage device.
+
+NOTE: The storage device that we will create is included as a sample with the WinSpd installer. Look in the `samples\rawdisk` directory.
+
+== Create the project skeleton
+
+We start by creating the Visual Studio project. Choose "Win32 Console Application" and select empty project.
+
+image::WinSpd-Tutorial/NewProject.png[Visual Studio New Project]
+
+NOTE: A user mode storage device services requests from the operating system. Therefore it becomes an important system component and must service requests timely. In general it should be a console mode application, not block for user input after it has been initialized, and not expose a GUI. This also allows the user mode storage device to be converted into a Windows service easily or to be controlled by the WinSpd.Launcher service.
+
+We add an empty file named `rawdisk.c` in the project and add the following skeleton code.
+
+.`*rawdisk.c*`
+[source,c]
+----
+#include <winspd/winspd.h>                                              // <1>
+
+int wmain(int argc, wchar_t **argv)
+{
+    return 0;
+}
+----
+<1> Include WinSpd header file.
+
+We must also set up the locations where Visual Studio can find the WinSpd headers and libraries. The following project settings must be made:
+
+- C/C++ > General > Additional Include Directories: `$(MSBuildProgramFiles32)\WinSpd\inc`
+- Linker > Input > Additional Dependencies: `$(MSBuildProgramFiles32)\WinSpd\lib\winspd-$(PlatformTarget).lib`
+
+NOTE: These settings assume that WinSpd has been installed in the default location under "Program Files".
+
+We now have a complete project skeleton and can proceed with implementing our storage device!
+
+== Top level code
+
+The top level code of the rawdisk storage device starts at `wmain`, performs command line handling, sets up a file to act as backing storage, creates a storage unit which is registered with the OS and starts servicing requests for it.
+
+We first consider command line handling. We want the rawdisk storage device to be used as follows:
+
+.`*usage*`
+----
+usage: rawdisk OPTIONS
+
+options:
+    -f RawDiskFile                      Storage unit data file
+    -c BlockCount                       Storage unit size in blocks
+    -l BlockLength                      Storage unit block length
+    -i ProductId                        1-16 chars
+    -r ProductRevision                  1-4 chars
+    -W 0|1                              Disable/enable writes (deflt: enable)
+    -C 0|1                              Disable/enable cache (deflt: enable)
+    -U 0|1                              Disable/enable unmap (deflt: enable)
+    -d -1                               Debug flags
+    -D DebugLogFile                     Debug log file; - for stderr
+    -p \\.\pipe\PipeName                Listen on pipe; omit to use driver
+----
+
+The full code to handle these command line parameters is straight forward and is omitted for brevity. It can be found in the `rawdisk.c` sample file that ships with the WinSpd installer. The code sets a number of variables that are used to configure each run of the rawdisk storage device.
+
+.`*wmain excerpt*`
+[source,c]
+----
+    PWSTR RawDiskFile = 0;
+    ULONG BlockCount = 1024 * 1024;
+    ULONG BlockLength = 512;
+    PWSTR ProductId = L"RawDisk";
+    PWSTR ProductRevision = L"1.0";
+    ULONG WriteAllowed = 1;
+    ULONG CacheSupported = 1;
+    ULONG UnmapSupported = 1;
+    ULONG DebugFlags = 0;
+    PWSTR DebugLogFile = 0;
+    PWSTR PipeName = 0;
+----
+
+The variable `DebugLogFile` is used to control the WinSpd debug logging mechanism. This mechanism can send messages to the debugger for display or log them into a file. The behavior is controlled by a call to `SpdDebugLogSetHandle`: if this call is not made any debug log messages will be sent to the debugger; if this call is made debug log messages will be logged into the specified file handle.
+
+.`*wmain excerpt*`
+[source,c]
+----
+    if (0 != DebugLogFile)
+    {
+        if (L'-' == DebugLogFile[0] && L'\0' == DebugLogFile[1])
+            DebugLogHandle = GetStdHandle(STD_ERROR_HANDLE);
+        else
+            DebugLogHandle = CreateFileW(
+                DebugLogFile,
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                0,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                0);
+        if (INVALID_HANDLE_VALUE == DebugLogHandle)
+            fail(GetLastError(), L"error: cannot open debug log file");
+
+        SpdDebugLogSetHandle(DebugLogHandle);
+    }
+----
+
+The remaining variables are used to set up a file to act as backing storage and create and start a storage unit.
+
+The `PipeName` variable has a special purpose. It determines the channel to use for incoming requests. User mode storage devices normally use the WinSpd kernel driver in order to service operating system storage requests. As an alternative they can also service storage requests that they receive over the named pipe whose name is contained in `PipeName`. This is useful for testing as will be explained later.
+
+.`*wmain excerpt*`
+[source,c]
+----
+    Error = RawDiskCreate(RawDiskFile,
+        BlockCount, BlockLength,
+        ProductId, ProductRevision,
+        !WriteAllowed,
+        !!CacheSupported,
+        !!UnmapSupported,
+        PipeName,
+        &RawDisk);                                                      // <1>
+    if (0 != Error)
+        fail(Error, L"error: cannot create RawDisk: error %lu", Error);
+    SpdStorageUnitSetDebugLog(RawDiskStorageUnit(RawDisk), DebugFlags); // <2>
+    Error = SpdStorageUnitStartDispatcher(
+        RawDiskStorageUnit(RawDisk), 2);                                // <3>
+    if (0 != Error)
+        fail(Error, L"error: cannot start RawDisk: error %lu", Error);
+
+    ...
+
+    SpdGuardSet(&ConsoleCtrlGuard, RawDiskStorageUnit(RawDisk));        // <4>
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);                    // <5>
+    SpdStorageUnitWaitDispatcher(RawDiskStorageUnit(RawDisk));          // <6>
+    SpdGuardSet(&ConsoleCtrlGuard, 0);                                  // <7>
+
+    RawDiskDelete(RawDisk);                                             // <8>
+----
+<1> Create the rawdisk storage unit.
+<1> Set debug log flags (-1 to enable all debug logs; 0 to disable all debug logs).
+<3> Start the storage unit dispatcher. At this point the storage unit starts receiving storage requests (if any).
+<4> Set a "guarded" pointer to the storage unit so that it can be shutdown in a thread-safe manner by the process console control handler.
+<5> Set up a console control handler for the process.
+<6> Wait until the storage unit (and its dispatcher) is shutdown.
+<7> Reset the "guarded" pointer.
+<8> Delete the rawdisk storage unit.
+
+We now consider the code for `RawDiskCreate`, `RawDiskDelete` and `ConsoleCtrlHandler`:
+
+.`*RawDiskCreate*`
+[source,c]
+----
+typedef struct _RAWDISK
+{
+    SPD_STORAGE_UNIT *StorageUnit;
+    UINT64 BlockCount;
+    UINT32 BlockLength;
+    HANDLE Handle;
+    HANDLE Mapping;
+    PVOID Pointer;
+    BOOLEAN Sparse;
+} RAWDISK;
+
+...
+
+static SPD_STORAGE_UNIT_INTERFACE RawDiskInterface =
+{
+    0,
+};
+
+DWORD RawDiskCreate(PWSTR RawDiskFile,
+    UINT64 BlockCount, UINT32 BlockLength,
+    PWSTR ProductId, PWSTR ProductRevision,
+    BOOLEAN WriteProtected,
+    BOOLEAN CacheSupported,
+    BOOLEAN UnmapSupported,
+    PWSTR PipeName,
+    RAWDISK **PRawDisk)
+{
+    RAWDISK *RawDisk = 0;
+    HANDLE Handle = INVALID_HANDLE_VALUE;
+    HANDLE Mapping = 0;
+    PVOID Pointer = 0;
+    FILE_SET_SPARSE_BUFFER Sparse;
+    DWORD BytesTransferred;
+    LARGE_INTEGER FileSize;
+    BOOLEAN ZeroSize;
+    SPD_PARTITION Partition;
+    SPD_STORAGE_UNIT_PARAMS StorageUnitParams;
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    DWORD Error;
+
+    *PRawDisk = 0;
+
+    memset(&StorageUnitParams, 0, sizeof StorageUnitParams);            // <1>
+    UuidCreate(&StorageUnitParams.Guid);                                // <1>
+    StorageUnitParams.BlockCount = BlockCount;                          // <1>
+    StorageUnitParams.BlockLength = BlockLength;                        // <1>
+    StorageUnitParams.MaxTransferLength = 64 * 1024;                    // <1>
+    if (0 == WideCharToMultiByte(CP_UTF8, 0,                            // <1>
+        ProductId, lstrlenW(ProductId),                                 // <1>
+        StorageUnitParams.ProductId,                                    // <1>
+        sizeof StorageUnitParams.ProductId,                             // <1>
+        0, 0))                                                          // <1>
+    {                                                                   // <1>
+        Error = ERROR_INVALID_PARAMETER;                                // <1>
+        goto exit;                                                      // <1>
+    }                                                                   // <1>
+    if (0 == WideCharToMultiByte(CP_UTF8, 0,                            // <1>
+        ProductRevision, lstrlenW(ProductRevision),                     // <1>
+        StorageUnitParams.ProductRevisionLevel,                         // <1>
+        sizeof StorageUnitParams.ProductRevisionLevel,                  // <1>
+        0, 0))                                                          // <1>
+    {                                                                   // <1>
+        Error = ERROR_INVALID_PARAMETER;                                // <1>
+        goto exit;                                                      // <1>
+    }                                                                   // <1>
+    StorageUnitParams.WriteProtected = WriteProtected;                  // <1>
+    StorageUnitParams.CacheSupported = CacheSupported;                  // <1>
+    StorageUnitParams.UnmapSupported = UnmapSupported;                  // <1>
+
+    RawDisk = malloc(sizeof *RawDisk);
+    if (0 == RawDisk)
+    {
+        Error = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
+    }
+
+    Handle = CreateFileW(RawDiskFile,
+        GENERIC_READ | GENERIC_WRITE, 0, 0,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);                         // <2>
+    if (INVALID_HANDLE_VALUE == Handle)
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    Sparse.SetSparse = TRUE;
+    Sparse.SetSparse = DeviceIoControl(Handle,
+        FSCTL_SET_SPARSE, &Sparse, sizeof Sparse, 0, 0,
+        &BytesTransferred, 0);                                          // <3>
+
+    if (!GetFileSizeEx(Handle, &FileSize))
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    ZeroSize = 0 == FileSize.QuadPart;
+    if (ZeroSize)
+        FileSize.QuadPart = BlockCount * BlockLength;
+    if (0 == FileSize.QuadPart ||
+        BlockCount * BlockLength != FileSize.QuadPart)                  // <4>
+    {
+        Error = ERROR_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    if (!SetFilePointerEx(Handle, FileSize, 0, FILE_BEGIN) ||
+        !SetEndOfFile(Handle))                                          // <5>
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    Mapping = CreateFileMappingW(Handle, 0, PAGE_READWRITE, 0, 0, 0);   // <6>
+    if (0 == Mapping)
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    Pointer = MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);     // <6>
+    if (0 == Pointer)
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    if (ZeroSize)
+    {
+        memset(&Partition, 0, sizeof Partition);
+        Partition.Type = 7;
+        Partition.BlockAddress =
+            4096 >= BlockLength ? 4096 / BlockLength : 1;
+        Partition.BlockCount = BlockCount - Partition.BlockAddress;
+        if (ERROR_SUCCESS ==
+            SpdDefinePartitionTable(&Partition, 1, Pointer))            // <7>
+        {
+            FlushViewOfFile(Pointer, 0);
+            FlushFileBuffers(Handle);
+        }
+    }
+
+    Error = SpdStorageUnitCreate(PipeName,
+        &StorageUnitParams, &RawDiskInterface, &StorageUnit);           // <8>
+    if (ERROR_SUCCESS != Error)
+        goto exit;
+
+    memset(RawDisk, 0, sizeof *RawDisk);
+    RawDisk->StorageUnit = StorageUnit;
+    RawDisk->BlockCount = BlockCount;
+    RawDisk->BlockLength = BlockLength;
+    RawDisk->Handle = Handle;
+    RawDisk->Mapping = Mapping;
+    RawDisk->Pointer = Pointer;
+    RawDisk->Sparse = Sparse.SetSparse;
+    StorageUnit->UserContext = RawDisk;                                 // <9>
+
+    *PRawDisk = RawDisk;
+
+    Error = ERROR_SUCCESS;
+
+exit:
+    if (ERROR_SUCCESS != Error)
+    {
+        if (0 != StorageUnit)
+            SpdStorageUnitDelete(StorageUnit);
+
+        if (0 != Pointer)
+            UnmapViewOfFile(Pointer);
+
+        if (0 != Mapping)
+            CloseHandle(Mapping);
+
+        if (INVALID_HANDLE_VALUE != Handle)
+            CloseHandle(Handle);
+
+        free(RawDisk);
+    }
+
+    return Error;
+}
+----
+<1> Initialize the `StorageUnitParams`. The `Guid` field should in general be persisted with the storage unit's backing storage, although this rule is not followed by the current version of the rawdisk storage device.
+<2> Create or open the file that will act as backing storage for our storage unit.
+<3> Attempt to set the file as sparse if the underlying file system supports it.
+<4> Double-check that the file size matches our expectation based on the storage unit geometry.
+<5> Set the file size to the appropriate value for the storage unit geometry. Note that if the file was successfuly set as sparse it should not occupy much actual space in the underlying file system.
+<6> Map the file in memory.
+<7> If the file was empty when it was first created we add a default partition that encompasses the whole storage unit.
+<8> Create the WinSpd `SPD_STORAGE_UNIT` object. If `PipeName` is `NULL` this includes associated kernel objects. If `PipeName` is not `NULL` the `SPD_STORAGE_UNIT` object will be associated with the specified named pipe, which is useful for testing.
+<9> Associate our private `RAWDISK` data structure with the WinSpd `SPD_STORAGE_UNIT` object.
+
+.`*RawDiskDelete*`
+[source,c]
+----
+VOID RawDiskDelete(RAWDISK *RawDisk)
+{
+    SpdStorageUnitDelete(RawDisk->StorageUnit);                         // <1>
+
+    FlushViewOfFile(RawDisk->Pointer, 0);                               // <2>
+    FlushFileBuffers(RawDisk->Handle);                                  // <2>
+    UnmapViewOfFile(RawDisk->Pointer);                                  // <2>
+    CloseHandle(RawDisk->Mapping);
+    CloseHandle(RawDisk->Handle);
+
+    free(RawDisk);
+}
+----
+<1> Delete the WinSpd `SPD_STORAGE_UNIT` object.
+<2> Flush and unmap the backing storage file.
+
+.`*ConsoleCtrlHandler*`
+[source,c]
+----
+static SPD_GUARD ConsoleCtrlGuard = SPD_GUARD_INIT;
+
+static BOOL WINAPI ConsoleCtrlHandler(DWORD CtrlType)
+{
+    SpdGuardExecute(&ConsoleCtrlGuard, SpdStorageUnitShutdown);         // <1>
+    return TRUE;
+}
+----
+<1> Shutdown the storage unit in a thread-safe manner.
+
+=== Test run
+
+We can now run the program from Visual Studio or the command line. This requires administrator privileges (as explained in the "Testing" section), but the program starts and services storage requests from the operating system. However because we have not yet implemented any storage request handlers all requests will be failed. This is demonstrated by the `diskpart` session below. Press Ctrl-C to stop the storage device.
+
+image::WinSpd-Tutorial/DiskpartError.png[Diskpart error]
+
+NOTE: Pressing Ctrl-C orderly stops the storage device (by calling `ConsoleCtrlHandler`). It is however possible to forcibly stop a storage device, e.g. by killing the process in the debugger. This is fine with WinSpd as *all associated resources will be automatically cleaned up*. This includes resources that WinSpd knows about such as associated kernel objects and memory, etc. It does not include resources that it has no knowledge about such as temporary files, network registrations, etc.
+
+== Storage unit operations
+
+We now start implementing the actual storage unit operations. These operations are the ones found in `SPD_STORAGE_UNIT_INTERFACE`.
+
+.`*Storage unit operations stubs*`
+[source,c]
+----
+static BOOLEAN Read(SPD_STORAGE_UNIT *StorageUnit,
+    PVOID Buffer, UINT64 BlockAddress, UINT32 BlockCount, BOOLEAN FlushFlag,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    return TRUE;
+}
+
+static BOOLEAN Write(SPD_STORAGE_UNIT *StorageUnit,
+    PVOID Buffer, UINT64 BlockAddress, UINT32 BlockCount, BOOLEAN FlushFlag,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    return TRUE;
+}
+
+static BOOLEAN Flush(SPD_STORAGE_UNIT *StorageUnit,
+    UINT64 BlockAddress, UINT32 BlockCount,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    return TRUE;
+}
+
+static BOOLEAN Unmap(SPD_STORAGE_UNIT *StorageUnit,
+    SPD_UNMAP_DESCRIPTOR Descriptors[], UINT32 Count,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    return TRUE;
+}
+
+static SPD_STORAGE_UNIT_INTERFACE RawDiskInterface =
+{
+    Read,
+    Write,
+    Flush,
+    Unmap,
+};
+----
+
+NOTE: Storage unit operations return `TRUE` to signal that they have processed a request. If a storage unit operation returns `FALSE` this means that the request has not been fully processed and is still pending. The user mode storage device may complete it at a later time using `SpdStorageUnitSendResponse`.
+
+=== Read / Write
+
+At a minimum a storage unit must implement `Read` and `Write`, unless the storage unit is write-protected (read-only) in which case it can only implement `Read`.
+
+`Read` is used to read block data from the storage unit.
+
+.`*Read*`
+[source,c]
+----
+static BOOLEAN Read(SPD_STORAGE_UNIT *StorageUnit,
+    PVOID Buffer, UINT64 BlockAddress, UINT32 BlockCount, BOOLEAN FlushFlag,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    if (FlushFlag)                                                      // <1>
+    {
+        FlushInternal(StorageUnit, BlockAddress, BlockCount, Status);
+        if (SCSISTAT_GOOD != Status->ScsiStatus)
+            return TRUE;
+    }
+
+    RAWDISK *RawDisk = StorageUnit->UserContext;
+    PVOID FileBuffer =
+        (PUINT8)RawDisk->Pointer + BlockAddress * RawDisk->BlockLength; // <2>
+
+    CopyBuffer(StorageUnit,
+        Buffer, FileBuffer, BlockCount * RawDisk->BlockLength,
+        SCSI_ADSENSE_UNRECOVERED_ERROR,
+        Status);                                                        // <3>
+
+    return TRUE;
+}
+----
+<1> If the `FlushFlag` is set then the storage unit cache must be flushed prior to reading.
+<2> Compute a pointer inside the backing storage file mapping based on arguments and our storage unit geometry.
+<3> Copy data from the file mapping into the supplied `Buffer`.
+
+`Write` is used to write block data to the storage unit.
+
+.`*Write*`
+[source,c]
+----
+static BOOLEAN Write(SPD_STORAGE_UNIT *StorageUnit,
+    PVOID Buffer, UINT64 BlockAddress, UINT32 BlockCount, BOOLEAN FlushFlag,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    RAWDISK *RawDisk = StorageUnit->UserContext;
+    PVOID FileBuffer =
+        (PUINT8)RawDisk->Pointer + BlockAddress * RawDisk->BlockLength; // <1>
+
+    CopyBuffer(StorageUnit,
+        FileBuffer, Buffer, BlockCount * RawDisk->BlockLength,
+        SCSI_ADSENSE_WRITE_ERROR,
+        Status);                                                        // <2>
+
+    if (SCSISTAT_GOOD == Status->ScsiStatus && FlushFlag)               // <3>
+        FlushInternal(StorageUnit, BlockAddress, BlockCount, Status);
+
+    return TRUE;
+}
+----
+<1> Compute a pointer inside the backing storage file mapping based on arguments and our storage unit geometry.
+<3> Copy data from the supplied `Buffer` into the file mapping.
+<3> If the `FlushFlag` is set then the storage unit cache must be flushed after writing.
+
+=== Flush
+
+A storage unit that has its own cache must implement `Flush`.
+
+.`*Flush*`
+[source,c]
+----
+static BOOLEAN Flush(SPD_STORAGE_UNIT *StorageUnit,
+    UINT64 BlockAddress, UINT32 BlockCount,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    return FlushInternal(StorageUnit,
+        BlockAddress, BlockCount, Status);                              // <1>
+}
+----
+<1> Simply call a helper function to perform the flushing. This will be described below.
+
+=== Unmap
+
+A storage unit may implement `Unmap` so that it can be informed by the OS when a block is no longer needed.
+
+.`*Unmap*`
+[source,c]
+----
+static BOOLEAN Unmap(SPD_STORAGE_UNIT *StorageUnit,
+    SPD_UNMAP_DESCRIPTOR Descriptors[], UINT32 Count,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    RAWDISK *RawDisk = StorageUnit->UserContext;
+    FILE_ZERO_DATA_INFORMATION Zero;
+    DWORD BytesTransferred;
+    PVOID FileBuffer;
+
+    for (UINT32 I = 0; Count > I; I++)
+    {
+        BOOLEAN SetZero = FALSE;
+
+        if (RawDisk->Sparse)
+        {
+            Zero.FileOffset.QuadPart = Descriptors[I].BlockAddress * RawDisk->BlockLength;
+            Zero.BeyondFinalZero.QuadPart = (Descriptors[I].BlockAddress + Descriptors[I].BlockCount) *
+                RawDisk->BlockLength;
+            SetZero = DeviceIoControl(RawDisk->Handle,
+                FSCTL_SET_ZERO_DATA, &Zero, sizeof Zero, 0, 0,
+                &BytesTransferred, 0);                                  // <1>
+        }
+
+        if (!SetZero)
+        {
+            FileBuffer = (PUINT8)RawDisk->Pointer + Descriptors[I].BlockAddress * RawDisk->BlockLength;
+
+            CopyBuffer(StorageUnit,
+                FileBuffer, 0, Descriptors[I].BlockCount * RawDisk->BlockLength,
+                SCSI_ADSENSE_NO_SENSE,
+                0);                                                     // <2>
+        }
+    }
+
+    return TRUE;
+}
+----
+<1> Use `FSCTL_SET_ZERO_DATA` to zero the relevant backing storage file range. File systems that support sparse files may "deallocate disk space" in the file in this case.
+<2> If the file is not sparse of the `FSCTL_SET_ZERO_DATA` method failed, zero the relevant backing storage file range. This is not strictly required by Windows, but it is required by the WinSpd test suites.
+
+=== Helper functions
+
+A number of functions were used in the implementation of the storage unit operations that have not been presented so far. We include them below.
+
+`CopyBuffer` is used to copy data from the backing storage file mapping to the OS supplied buffers or vice-versa. This is a simple memory copy operation, except that it must also be able to deal with the `EXCEPTION_IN_PAGE_ERROR` exception code, which means that there was an I/O error with the file mapping.
+
+.`*CopyBuffer and ExceptionFilter*`
+[source,c]
+----
+static inline BOOLEAN ExceptionFilter(ULONG Code, PEXCEPTION_POINTERS Pointers,
+    PUINT_PTR PDataAddress)
+{
+    if (EXCEPTION_IN_PAGE_ERROR != Code)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    *PDataAddress = 2 <= Pointers->ExceptionRecord->NumberParameters ?
+        Pointers->ExceptionRecord->ExceptionInformation[1] : 0;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static VOID CopyBuffer(SPD_STORAGE_UNIT *StorageUnit,
+    PVOID Dst, PVOID Src, ULONG Length, UINT8 ASC,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    RAWDISK *RawDisk = StorageUnit->UserContext;
+    UINT_PTR ExceptionDataAddress;
+    UINT64 Information, *PInformation;
+
+    __try
+    {
+        if (0 != Src)
+            memcpy(Dst, Src, Length);                                   // <1>
+        else
+            memset(Dst, 0, Length);                                     // <1>
+    }
+    __except (ExceptionFilter(GetExceptionCode(), GetExceptionInformation(), &ExceptionDataAddress))
+    {
+        if (0 != Status)
+        {
+            PInformation = 0;
+            if (0 != ExceptionDataAddress)
+            {
+                Information = (UINT64)(ExceptionDataAddress - (UINT_PTR)RawDisk->Pointer) /
+                    RawDisk->BlockLength;                               // <2>
+                PInformation = &Information;
+            }
+
+            SpdStorageUnitStatusSetSense(Status,
+                SCSI_SENSE_MEDIUM_ERROR, ASC, PInformation);            // <3>
+        }
+    }
+}
+----
+<1> The actual memory copy or set operation that needs to be protected from any file mapping I/O errors. (These errors should be non-existent in practice, except if the underlying file system is on a bad medium.)
+<2> `Information` is used to pass information about the actual block address that caused the I/O error. 
+<3> `SpdStorageUnitStatusSetSense` is used to report a SCSI error to the operating system.
+
+`FlushInternal` is used by the `Read`, `Write` and `Flush` storage operations to actually flush the backing storage file.
+
+.`*FlushInternal*`
+[source,c]
+----
+static BOOLEAN FlushInternal(SPD_STORAGE_UNIT *StorageUnit,
+    UINT64 BlockAddress, UINT32 BlockCount,
+    SPD_STORAGE_UNIT_STATUS *Status)
+{
+    RAWDISK *RawDisk = StorageUnit->UserContext;
+    PVOID FileBuffer = (PUINT8)RawDisk->Pointer + BlockAddress * RawDisk->BlockLength;
+
+    if (!FlushViewOfFile(FileBuffer, BlockCount * RawDisk->BlockLength))
+        goto error;
+    if (!FlushFileBuffers(RawDisk->Handle))
+        goto error;
+
+    return TRUE;
+
+error:
+    SpdStorageUnitStatusSetSense(Status,
+        SCSI_SENSE_MEDIUM_ERROR, SCSI_ADSENSE_WRITE_ERROR, 0);
+
+    return TRUE;
+}
+----
+
+== Testing the storage device
+
+=== Testing during development
+
+During development of a user mode storage device it is often advantageous to test our work without fully integrating the device with the operating system. This is so because of two reasons: (1) it avoids the need to develop with administrator privileges (integrating the storage device with the operating system requires such privileges) and (2) it maximizes development system stability.
+
+For this purpose WinSpd provides the option to listen for requests on a named pipe when creating an `SPD_STORAGE_UNIT` object. Any program can be used to send requests to the specified named pipe, but WinSpd already includes one called `stgtest`.
+
+.`*stgtest usage*`
+----
+usage: stgtest [-s Seed] \\.\pipe\PipeName\Target OpCount [RWFU] [Address|*] [Count|*]
+usage: stgtest [-s Seed] \\.\X: OpCount [RWFU] [Address|*] [Count|*]
+    -s Seed     Seed to use for randomness (default: time)
+    PipeName    Name of storage unit pipe
+    Target      SCSI target id (usually 0)
+    X:          Volume drive (must use RAW file system; requires admin)
+    OpCount     Operation count
+    RWFU        One or more: R: Read, W: Write, F: Flush, U: Unmap
+    Address     Starting block address, *: random
+    Count       Block count per operation, *: random
+----
+
+To test our rawdisk storage unit make the following project setting:
+
+- Debugging > Command Arguments: `-f $(OutDir)test.rawdisk -p \\.\pipe\rawdisk`
+
+Now run the rawdisk storage device under Visual Studio and then from a command prompt try:
+
+.`*stgtest invocation*`
+----
+>stgtest-x64 \\.\pipe\rawdisk\0 1000 WR
+stgtest -s 20308937 \\.\pipe\rawdisk\0 1000 "WR" 0:0 0
+OK
+----
+
+This will send 1000 total requests with a pattern of `Write`, `Read` starting at block address 0; `stgtest` checks that anything that it writes with `Write` is what it reads back with `Read`. It is also possible to send requests at random block addresses and with random block counts.
+
+Note that the pipe name used with `stgtest` is `\\.\pipe\rawdisk\0` and not `\\.\pipe\rawdisk` as we specified when launching `rawdisk`. This is because a single user mode storage device may service multiple storage units. While the rawdisk storage device does not support multiple storage units, if it did the first storage unit would be accessible via the pipe name `\\.\pipe\rawdisk\0`, the second via the name `\\.\pipe\rawdisk\1` and so on.
+
+=== Testing the integration with the operating system
+
+`Stgtest` can also be used to test a storage unit that has been mounted (integrated) with the operating system. For this purpose it uses the Windows RAW file system, which is a simple file system that views a whole volume / partition as a single file. Windows uses the RAW file system when it does not recognize any other file system in a particular disk partition.
+
+WARNING: `Stgtest` writes random data over a storage unit. Do not use to test a storage unit that has been formatted with a file system.
+
+To test our rawdisk storage unit when mounted with the operating system make the following project setting:
+
+- Debugging > Command Arguments: `-f $(OutDir)test.rawdisk`
+
+Make sure to delete any `test.rawdisk` file that is found in the Visual Studio output directory (`$(OutDir)`). Recall that rawdisk uses the `SpdDefinePartitionTable` API to create a partition table if it is started with an empty or non-existent file. This is useful because Windows mounts partitioned disks automatically. Alternatively you can use `diskpart` to partition when needed.
+
+If we now attempt to run the rawdisk storage device this will likely fail with error 5, which is the Windows error code for "Access Denied". This happens because mounting a storage unit requires administrator privileges.
+
+Restart Visual Studio with Administrator privileges and run the rawdisk storage device again.
+
+image::WinSpd-Tutorial/FirstRun.png[First run]
+
+Windows Explorer will likely open up offering to format the new disk:
+
+image::WinSpd-Tutorial/Explorer.png[Explorer]
+
+The new disk is also visible in the Windows Device Manager:
+
+image::WinSpd-Tutorial/DeviceManager.png[Device Manager]
+
+We can now try the following from an Administrator command prompt:
+
+.`*stgtest invocation*`
+----
+>stgtest-x64.exe \\.\E: 1000 WR
+stgtest -s 24754015 \\.\E: 1000 "WR" 0:0 0
+OK
+----
+
+[NOTE]
+====
+Sometimes the Windows behavior of offering to format a new disk can be somewhat troublesome, especially when testing. You can stop it by using:
+----
+>net stop shellhwdetection
+The Shell Hardware Detection service is stopping.
+The Shell Hardware Detection service was stopped successfully.
+----
+
+To start it again:
+----
+>net start shellhwdetection
+The Shell Hardware Detection service is starting.
+The Shell Hardware Detection service was started successfully.
+----
+====
+
+== Achieving complete integration
+
+WinSpd includes functionality that allows for complete integration into the Windows environment:
+
+- Starting storage devices in the Windows Services context, which has the necessary permissions to access the WinSpd kernel driver and create storage units.
+- Support for mounting a storage unit represented by a file via the Windows Explorer.
+- Support for ejecting (dismounting) a storage unit via the Windows Explorer.
+- Support for starting a storage unit when the system starts.
+
+This functionality is supported by: (1) the WinSpd Launcher, which is a Windows Service that can be used to start and stop user mode storage devices, and (2) the WinSpd Shellex, which is a Windows Shell extension DLL that provides right-click menu functionality.
+
+Any user mode storage device can easily take advantage of this functionality. The rawdisk storage device that ships with WinSpd already has the proper registrations in place. They are included below for completeness, but they can easily be explored with the Windows Registry Editor.
+
+.`*rawdisk registry entries*`
+----
+[HKEY_CLASSES_ROOT\.rawdisk]
+@="WinSpd.DiskFile"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\WinSpd\Services\rawdisk]
+"Executable"="C:\\Program Files (x86)\\WinSpd\\bin\\rawdisk-x64.exe"
+"CommandLine"="-f %1"
+"Security"="D:P(A;;RP;;;WD)"
+----
+
+With these registry entries in place a file with a `.rawdisk` extension can be mounted by double-clicking and ejected by right-clicking on the corresponding disk icon in Explorer.
+
+Finally it is possible to make mounts persistent, by adding a registry value with name `Persistent` and a `REG_DWORD` value of `1` under the `WinSpd\Services\rawdisk` key. This would ensure that the Launcher restarts any existing rawdisk mounts upon system restart.
+
+== Conclusion
+
+The rawdisk storage device that ships with WinSpd and was presented here is a mere 461 lines of code (as reported by cloc) at the time of this writing. Despite this it implements all functionality required by Windows in order to function as a proper "disk". It integrates fully with the OS and can be partitioned and formatted with any disk file system.
